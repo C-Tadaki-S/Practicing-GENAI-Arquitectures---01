@@ -9,7 +9,7 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
-
+from sentence_transformers.cross_encoder import CrossEncoder
 # Carregar e preparar os dados 
 DATA_PATH = "docs/"
 print("Carregando documentos PDF...")
@@ -46,6 +46,12 @@ else:
 # --- 3: CONFIGURAÇÃO DAS CHAINS E COMPONENTES ---
 llm = OllamaLLM(model="llama3:8b")
 
+# NOVO: Carrega o modelo de Cross-Encoder para Re-ranking
+print("Carregando modelo de Re-ranker (Cross-Encoder)...")
+cross_encoder = CrossEncoder('BAAI/bge-reranker-base')
+print("Re-ranker carregado.")
+
+
 # Função de expansão de pergunta (sem alterações)
 def expandir_pergunta(pergunta, llm):
     prompt_expansao = PromptTemplate.from_template(
@@ -64,26 +70,32 @@ def expandir_pergunta(pergunta, llm):
 
 # Prompt para a geração da resposta final (sem alterações)
 prompt_template_texto = """
-Você é um assistente de pesquisa altamente qualificado. Sua tarefa é responder à pergunta do usuário de forma precisa e concisa, baseando-se estritamente no contexto fornecido.
-Analise todos os trechos de contexto abaixo antes de formular sua resposta.
-Se a informação necessária não estiver presente em nenhum dos trechos, responda exatamente: 'Com base nos documentos fornecidos, não encontrei a informação solicitada.'.
-Não utilize nenhum conhecimento prévio.
+Você é um assistente de pesquisa especializado. Sua tarefa é responder à pergunta do usuário de forma clara e direta, baseando-se exclusivamente no contexto fornecido.
+
+Siga estas regras estritamente:
+1.  Primeiro, responda diretamente à pergunta do usuário com "Sim.", "Não." ou "A informação não é conclusiva com base no contexto.".
+2.  Após a resposta direta, justifique-a citando as informações mais relevantes encontradas no contexto.
+3.  Se o contexto não contiver NENHUMA informação relacionada à pergunta, e somente nesse caso, responda: 'Não há informações sobre este assunto nos documentos fornecidos.'.
+
 Contexto:
 {context}
+
 Pergunta:
 {input}
-Resposta Precisa:
+
+Resposta:
 """
 prompt = PromptTemplate.from_template(prompt_template_texto)
 
 # Chain que efetivamente gera a resposta a partir do contexto e da pergunta
 combine_docs_chain = create_stuff_documents_chain(llm, prompt)
 
-# --- 4. EXECUÇÃO E TESTE ---
+# --- SEÇÃO 4: EXECUÇÃO E TESTE (Grandes alterações aqui) ---
 
-# CORREÇÃO 1: Definimos o retriever UMA VEZ, aqui.
-retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-print("Retriever criado com k=6.")
+# MUDANÇA: Aumentamos o 'k' para a recuperação inicial (Recall)
+K_RECUPERACAO_INICIAL = 20
+retriever = vectorstore.as_retriever(search_kwargs={"k": K_RECUPERACAO_INICIAL})
+print(f"Retriever criado para a fase de RECUPERAÇÃO com k={K_RECUPERACAO_INICIAL}.")
 
 print("\n--- Inicie a conversa com o assistente de pesquisa (digite 'sair' para terminar) ---")
 while True:
@@ -91,13 +103,13 @@ while True:
     if pergunta_usuario.lower() == 'sair':
         break
 
-    # PASSO DE EXPANSÃO DE PERGUNTA
-    print("\n--- Expandindo a pergunta... ---")
+    # 1. FASE DE EXPANSÃO DE PERGUNTA
+    print("\n--- Fase 1: Expandindo a pergunta... ---")
     perguntas_para_busca = expandir_pergunta(pergunta_usuario, llm)
     print("Perguntas usadas na busca:", perguntas_para_busca)
 
-    # PASSO DE BUSCA USANDO TODAS AS PERGUNTAS
-    # Usamos o retriever definido anteriormente
+    # 2. FASE DE RECUPERAÇÃO (RECALL)
+    print(f"\n--- Fase 2: Recuperando até {K_RECUPERACAO_INICIAL} chunks candidatos... ---")
     retrieved_docs_list = retriever.batch(perguntas_para_busca)
     
     documentos_unicos = {}
@@ -106,16 +118,34 @@ while True:
             if doc.page_content not in documentos_unicos:
                 documentos_unicos[doc.page_content] = doc
     
-    documentos_recuperados = list(documentos_unicos.values())
-    
-    print(f"\n--- {len(documentos_recuperados)} Documentos Únicos Recuperados (Diagnóstico) ---")
-    for i, doc in enumerate(documentos_recuperados[:10]): # Mostra até 6
-        print(f"--- Documento {i+1} ---\n{doc.page_content}\n--------------------------\n")
+    candidatos = list(documentos_unicos.values())
+    print(f"Total de {len(candidatos)} chunks candidatos únicos recuperados.")
 
-    # CORREÇÃO 2: Invocamos a chain que GERA a resposta, passando o contexto que JÁ ENCONTRAMOS
+    # 3. FASE DE RE-RANKING (PRECISION)
+    print(f"\n--- Fase 3: Re-rankeando os {len(candidatos)} candidatos... ---")
+    # Prepara os pares (pergunta, chunk) para o cross-encoder
+    pares_para_reranking = [[pergunta_usuario, doc.page_content] for doc in candidatos]
+    
+    # Obtém as pontuações de relevância
+    scores = cross_encoder.predict(pares_para_reranking)
+    
+    # Combina os documentos com suas novas pontuações e ordena
+    docs_com_scores = list(zip(candidatos, scores))
+    docs_re_rankeados = sorted(docs_com_scores, key=lambda x: x[1], reverse=True)
+    
+    # Seleciona o Top N final para enviar ao LLM
+    K_FINAL = 4
+    documentos_finais = [doc for doc, score in docs_re_rankeados[:K_FINAL]]
+
+    print(f"\n--- {len(documentos_finais)} Documentos Finais após Re-ranking (Diagnóstico) ---")
+    for i, doc in enumerate(documentos_finais):
+        # Mostra o score do re-ranker para diagnóstico
+        print(f"--- Documento {i+1} (Score: {docs_re_rankeados[i][1]:.4f}) ---\n{doc.page_content}\n--------------------------\n")
+
+    # 4. FASE DE GERAÇÃO
     response = combine_docs_chain.invoke({
         "input": pergunta_usuario, 
-        "context": documentos_recuperados
+        "context": documentos_finais # Enviamos apenas os documentos re-rankeados
     })
 
     print("\nResposta do Assistente:")
