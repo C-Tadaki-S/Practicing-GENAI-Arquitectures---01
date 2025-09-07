@@ -2,42 +2,60 @@ import os
 from crewai import Agent, Task, Crew, Process
 from langchain_ollama import OllamaLLM
 from dotenv import load_dotenv
-
-# Carrega as variáveis de ambiente (nossa chave de API) do arquivo .env
-load_dotenv() 
-
-# Importando a ferramenta Serper
 from crewai_tools import SerperDevTool
 
-# Inicializando o LLM local
+# # Importe a anotação @tool para criar ferramentas personalizadas
+from crewai.tools import tool
+
+load_dotenv()
 ollama_llm = OllamaLLM(model="ollama/llama3")
 
-# Inicializando a nova ferramenta de busca
-search_tool = SerperDevTool()
+# #############################################################################
+# ## ESTRATÉGIA 2: CRIANDO NOSSA FERRAMENTA SEGURA                       ##
+# #############################################################################
 
-# --- DEFINIÇÃO DOS AGENTES ---
+# Inicializamos a ferramenta original que queremos "envolver"
+serper_tool = SerperDevTool()
 
-# Agente 1: Pesquisador de Cidades
+@tool("Ferramenta de Busca Segura na Internet")
+def safe_serper_search(query: str) -> str:
+    """
+    Uma ferramenta de busca na internet que é mais segura de usar.
+    Ela extrai automaticamente o texto da pesquisa mesmo que o input venha em um formato incorreto.
+    Use esta ferramenta para qualquer pesquisa na web.
+    """
+    # Verifica se o input (query) é um dicionário, como no erro que vimos
+    if isinstance(query, dict):
+        # Se for, extrai o valor da chave 'description' ou 'search_query'
+        search_query = query.get('description') or query.get('search_query', '')
+    else:
+        # Se não, o input já é um texto simples (string)
+        search_query = query
+    
+    # Executa a busca com o texto limpo e retorna o resultado
+    return serper_tool.run(search_query)
+
+# #############################################################################
+# ## AGORA USAMOS a 'safe_serper_search' em vez da 'SerperDevTool'         ##
+# #############################################################################
+
 city_researcher = Agent(
   role='Pesquisador de Destinos Turísticos',
   goal='Encontrar as atrações mais interessantes e eventos culturais para uma cidade específica.',
-  backstory="""Você é um pesquisador experiente, mestre em usar a internet para
-  descobrir joias escondidas e pontos turísticos imperdíveis em qualquer cidade do mundo.""",
+  backstory="""Você é um pesquisador experiente...""",
   verbose=True,
   allow_delegation=False,
-  tools=[search_tool],
+  tools=[safe_serper_search], # <-- USANDO A NOVA FERRAMENTA
   llm=ollama_llm
 )
 
-# Agente 2: Curador de Restaurantes
 food_critic = Agent(
   role='Especialista em Gastronomia Local',
-  goal='Descobrir as melhores e mais autênticas experiências gastronômicas em uma cidade.',
-  backstory="""Com um paladar refinado e um faro para comida boa, você é o guia
-  definitivo para encontrar desde tascas tradicionais até restaurantes com estrelas Michelin.""",
+  goal='Descobrir as melhores e mais autênticas experiências gastronômicas...',
+  backstory="""Com um paladar refinado...""",
   verbose=True,
   allow_delegation=False,
-  tools=[search_tool],
+  tools=[safe_serper_search], # <-- USANDO A NOVA FERRAMENTA
   llm=ollama_llm
 )
 
@@ -61,7 +79,9 @@ task_city_research = Task(
 )
 
 task_food_research = Task(
-  description='Com base nas informações da cidade de Porto, encontre 5 opções de restaurantes que ofereçam uma experiência local autêntica. Inclua uma opção econômica, uma de gama média e uma mais sofisticada. Descreva o tipo de comida e o que torna cada lugar especial.',
+  description="""Com base nas informações da cidade de Porto, encontre 5 opções de restaurantes que ofereçam uma experiência local autêntica. Inclua uma opção econômica, uma de gama média e uma mais sofisticada. Descreva o tipo de comida e o que torna cada lugar especial.
+  Para usar a ferramenta de busca, passe um texto simples para o argumento 'search_query'.
+  Por exemplo: 'restaurantes de comida tradicional no Porto'.""",
   expected_output='Uma lista de 5 restaurantes, com nome, faixa de preço, tipo de cozinha e um pequeno parágrafo descritivo para cada.',
   agent=food_critic,
   context=[task_city_research]
