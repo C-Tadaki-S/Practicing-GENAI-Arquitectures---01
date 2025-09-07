@@ -127,7 +127,6 @@ if __name__ == "__main__":
             break
 
         rota = router_chain.invoke({"input": pergunta_usuario}).content.strip().lower()
-
         resposta_final = ""
         if "pesquisa_documentos" in rota:
             resposta_final = run_rag_pipeline(pergunta_usuario)
